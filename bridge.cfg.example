@@ -1,0 +1,15 @@
+[log]
+debug = false
+
+[meshcore]
+# serial = /dev/ttyACM0
+# ble = AA:BB:CC:DD:EE:FF
+# tcp = 192.168.1.10:4403
+baudrate = 115200
+max_msg_len = 200
+
+[irc]
+host = 127.0.0.1
+port = 6667
+# password = secret
+voice_timeout = 600
