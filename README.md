@@ -2,8 +2,6 @@
 
 An IRC server bridge on top of MeshCore — use your favourite IRC client to join the mesh.
 
-![](./about.png)
-
 ## Features
 
 - All MeshCore channels discovered automatically and mapped to IRC channels (`#public`, `#radio-actief`, …)
