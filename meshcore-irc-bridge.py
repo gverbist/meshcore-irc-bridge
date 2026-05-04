@@ -3,6 +3,7 @@
 import asyncio
 import argparse
 import logging
+import re
 
 from meshcore import MeshCore, EventType
 
@@ -11,13 +12,25 @@ logger = logging.getLogger(__name__)
 # See the IRC protocol RFC for details
 # https://www.rfc-editor.org/rfc/rfc1459
 
+MAX_CHANNELS = 40
+CONSECUTIVE_EMPTY_LIMIT = 5
+
+
+def _to_irc_channel(name):
+    sanitized = re.sub(r'[^a-z0-9\-_]', '', name.lower().replace(' ', '-'))
+    return f"#{sanitized or 'channel'}"
+
+
 class Bridge:
     def __init__(self, meshcore):
         self.mesh = meshcore
         self.client = None
+        self._chan_to_irc = {}  # channel_idx (int) -> irc channel name (str)
+        self._irc_to_chan = {}  # irc channel name (str) -> channel_idx (int)
 
     async def start(self, host, port):
         await self.mesh.ensure_contacts()
+        await self._discover_channels()
         self.mesh.subscribe(EventType.CHANNEL_MSG_RECV, self._on_mesh_channel_msg)
         self.mesh.subscribe(EventType.CONTACT_MSG_RECV, self._on_mesh_private_msg)
         await self.mesh.start_auto_message_fetching()
@@ -26,6 +39,55 @@ class Bridge:
 
         async with server:
             await server.serve_forever()
+
+    async def _discover_channels(self):
+        consecutive_empty = 0
+
+        for idx in range(MAX_CHANNELS):
+            try:
+                event = await self.mesh.commands.get_channel(idx)
+            except Exception as e:
+                logger.warning(f"Failed to query channel {idx}: {e}")
+                consecutive_empty += 1
+                if consecutive_empty >= CONSECUTIVE_EMPTY_LIMIT:
+                    break
+                continue
+
+            if event.type != EventType.CHANNEL_INFO:
+                consecutive_empty += 1
+                if consecutive_empty >= CONSECUTIVE_EMPTY_LIMIT:
+                    break
+                continue
+
+            name = event.payload.get("channel_name", "").strip("\x00").strip()
+
+            if not name:
+                consecutive_empty += 1
+                if consecutive_empty >= CONSECUTIVE_EMPTY_LIMIT:
+                    break
+                continue
+
+            consecutive_empty = 0
+            irc_name = _to_irc_channel(name)
+
+            if irc_name in self._irc_to_chan:
+                irc_name = f"{irc_name}-{idx}"
+
+            self._chan_to_irc[idx] = irc_name
+            self._irc_to_chan[irc_name] = idx
+            logger.info(f"Discovered channel {idx}: {name!r} -> {irc_name}")
+
+        if not self._chan_to_irc:
+            self._chan_to_irc[0] = "#public"
+            self._irc_to_chan["#public"] = 0
+            logger.info("No channels discovered from device, defaulting to #public")
+
+    def _register_channel(self, idx):
+        irc_name = f"#channel-{idx}"
+        self._chan_to_irc[idx] = irc_name
+        self._irc_to_chan[irc_name] = idx
+        logger.info(f"Auto-registered unknown channel {idx} as {irc_name}")
+        return irc_name
 
     async def _on_mesh_channel_msg(self, event):
         logging.debug(event)
@@ -38,16 +100,18 @@ class Bridge:
         if payload.get("type") != "CHAN":
             return
 
-        if payload.get("channel_idx") != 0:
-            return
-
         if payload.get("txt_type") != 0:
             return
 
+        channel_idx = payload.get("channel_idx")
         message = payload.get("text")
 
-        if not message:
+        if channel_idx is None or not message:
             return
+
+        irc_channel = self._chan_to_irc.get(channel_idx)
+        if irc_channel is None:
+            irc_channel = self._register_channel(channel_idx)
 
         parts = message.split(":", 1)
 
@@ -56,17 +120,13 @@ class Bridge:
 
         # need better way to get contact name for a channel
         # message; protocol does not even contain pub key
-        #nick = parts[0].strip()
-        #message = parts[1].strip()
         nick = "mesh"
         message = parts[0] + ":" + parts[1]
 
         # need better sanitization
-        message = message.replace("\r", "")
-        message = message.replace("\n", " ")
-        message = message.replace("\0", "")
+        message = message.replace("\r", "").replace("\n", " ").replace("\0", "")
 
-        await self.client.send(f":{nick}!{nick}@mesh PRIVMSG #public :{message}")
+        await self.client.send(f":{nick}!{nick}@mesh PRIVMSG {irc_channel} :{message}")
 
     async def _on_mesh_private_msg(self, event):
         logging.debug(event)
@@ -94,9 +154,7 @@ class Bridge:
         message = text.strip()
 
         # need better sanitization
-        message = message.replace("\r", "")
-        message = message.replace("\n", " ")
-        message = message.replace("\0", "")
+        message = message.replace("\r", "").replace("\n", " ").replace("\0", "")
 
         await self.client.send(f":{nick}!{nick}@mesh PRIVMSG {self.client.nick} :{message}")
 
@@ -203,13 +261,14 @@ class Bridge:
         channels = parts[0]
 
         for chan in channels.split(","):
-            if chan == "#public":
-                client.channels.add(chan)
+            channel_idx = self._irc_to_chan.get(chan)
 
-                await client.send(f":{client.prefix} JOIN #public")
-                await client.send(f":mesh 332 {client.nick} #public :MeshCore Public Channel")
-                await client.send(f":mesh 353 {client.nick} = #public :{client.nick}")
-                await client.send(f":mesh 366 {client.nick} #public :End of /NAMES list")
+            if channel_idx is not None:
+                client.channels.add(chan)
+                await client.send(f":{client.prefix} JOIN {chan}")
+                await client.send(f":mesh 332 {client.nick} {chan} :MeshCore {chan.lstrip('#').title()} Channel")
+                await client.send(f":mesh 353 {client.nick} = {chan} :{client.nick}")
+                await client.send(f":mesh 366 {client.nick} {chan} :End of /NAMES list")
             else:
                 await client.send(f":mesh 403 {client.nick} {chan} :No such channel")
 
@@ -242,26 +301,27 @@ class Bridge:
                 await client.send(f":mesh 442 {client.nick} {target} :You're not on that channel")
                 return
 
-            if target == "#public":
-                await client.send(f":mesh 324 {client.nick} #public +nt")
+            if target in self._irc_to_chan:
+                await client.send(f":mesh 324 {client.nick} {target} +nt")
         else:
             await client.send(f":mesh 502 {client.nick} :Cant change mode for other users")
 
     async def _handle_list(self, client, params):
-        if not params:
-            await client.send(f":mesh 321 {client.nick} Channel :Users Name")
-            await client.send(f":mesh 322 {client.nick} #public 0 :Public")
-            await client.send(f":mesh 323 {client.nick} :End of LIST")
+        channels_to_list = sorted(self._irc_to_chan.keys())
 
-            return
+        if params:
+            requested = params.split(",")
+            for chan in requested:
+                if chan not in self._irc_to_chan:
+                    await client.send(f":mesh 403 {client.nick} {chan} :No such channel")
+            channels_to_list = [c for c in requested if c in self._irc_to_chan]
 
-        for chan in params.split(","):
-            if chan == "#public":
-                await client.send(f":mesh 321 {client.nick} Channel :Users Name")
-                await client.send(f":mesh 322 {client.nick} #public 0 :Public")
-                await client.send(f":mesh 323 {client.nick} :End of LIST")
-            else:
-                await client.send(f":mesh 403 {client.nick} {chan} :No such channel")
+        await client.send(f":mesh 321 {client.nick} Channel :Users Name")
+
+        for chan in channels_to_list:
+            await client.send(f":mesh 322 {client.nick} {chan} 0 :{chan.lstrip('#').title()}")
+
+        await client.send(f":mesh 323 {client.nick} :End of LIST")
 
     async def _handle_privmsg(self, client, params):
         target, _, msg = params.partition(" ")
@@ -272,8 +332,10 @@ class Bridge:
             return
 
         if target.startswith("#"):
-            if target == "#public":
-                result = await self.mesh.commands.send_chan_msg(0, msg)
+            channel_idx = self._irc_to_chan.get(target)
+
+            if channel_idx is not None:
+                result = await self.mesh.commands.send_chan_msg(channel_idx, msg)
 
                 if result.type == EventType.ERROR:
                     await client.send(f":mesh NOTICE {client.nick} :Failed to send message to {target}")
